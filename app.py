@@ -1,54 +1,77 @@
 import torch
 import gradio as gr
+import requests
 from PIL import Image
+from io import BytesIO
 from diffusers import QwenImageEditPlusPipeline
 
-# Load the model (Optimized for H100)
+# 1. LOAD MODEL (Full bfloat16 for H100)
 pipe = QwenImageEditPlusPipeline.from_pretrained(
     "Qwen/Qwen-Image-Edit-2509", 
     torch_dtype=torch.bfloat16
 ).to("cuda")
 
-def process_edit(target_img, ref_img, prompt):
-    if target_img is None or ref_img is None:
-        return None
-    
-    # Qwen-2509 takes a list of images
-    # Image 1 = Target (to be changed), Image 2 = Reference (the style/light source)
-    inputs = {
-        "image": [target_img, ref_img],
-        "prompt": prompt,
-        "num_inference_steps": 40,
-        "true_cfg_scale": 4.0,
-    }
-    
-    with torch.inference_mode():
-        output = pipe(**inputs)
-    return output.images[0]
+def process_edit(target_url, ref_url, prompt, neg_prompt):
+    try:
+        # Download images from the links you provide
+        t_resp = requests.get(target_url, timeout=10)
+        r_resp = requests.get(ref_url, timeout=10)
+        
+        img1 = Image.open(BytesIO(t_resp.content)).convert("RGB")
+        img2 = Image.open(BytesIO(r_resp.content)).convert("RGB")
+        
+        # 2. MATCH SIZES (Prevents the crash you experienced)
+        # We target 1024x1024 as the model's sweet spot
+        img1 = img1.resize((1024, 1024), Image.LANCZOS)
+        img2 = img2.resize((1024, 1024), Image.LANCZOS)
 
-# Build the UI
-with gr.Blocks(title="Qwen Image Edit 2509") as demo:
-    gr.Markdown("# Qwen Image Edit - Portrait & Style Fixer")
+        # 3. RUN THE EDIT
+        # If Slot 1 and Slot 2 are the same pic, it acts as a "Self-Reference" 
+        # which makes the edit much cleaner and holds the identity better.
+        output = pipe(
+            image=[img1, img2],
+            prompt=prompt,
+            negative_prompt=neg_prompt,
+            num_inference_steps=40,
+            true_cfg_scale=4.0,  # Fixed: Now has negative_prompt to reference
+            height=1024,
+            width=1024
+        ).images[0]
+        
+        return output
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        return None
+
+# 4. THE UI
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Qwen Multi-Image Editor (H100 Optimized)")
     
     with gr.Row():
         with gr.Column():
-            # CLEAR SLOT NAMES AS REQUESTED
-            input_target = gr.Image(label="SLOT 1: TARGET IMAGE (The one to fix)", type="pil")
-            input_ref = gr.Image(label="SLOT 2: REFERENCE IMAGE (The good lighting/style)", type="pil")
-            prompt_text = gr.Textbox(
+            url1 = gr.Textbox(label="SLOT 1: TARGET IMAGE URL (The Base)", placeholder="Paste .jpg/.png link...")
+            url2 = gr.Textbox(label="SLOT 2: REFERENCE IMAGE URL (The Style/Identity)", placeholder="Paste .jpg/.png link...")
+            
+            prompt_input = gr.Textbox(
                 label="Instruction", 
-                placeholder="Example: Apply the lighting and skin texture from Slot 2 to the person in Slot 1",
-                value="Transfer the professional lighting from the second image to the person in the first image."
+                value="Using the identity/details from image 2, change the target image 1 by: [YOUR EDIT HERE]"
             )
-            submit_btn = gr.Button("Fix Image", variant="primary")
+            
+            neg_input = gr.Textbox(
+                label="Negative Prompt (Prevents Crashes)", 
+                value="low quality, blurry, distorted, deformed, out of focus"
+            )
+            
+            run_btn = gr.Button("GENERATE EDIT", variant="primary")
         
         with gr.Column():
-            output_view = gr.Image(label="RESULT (View & Download)")
+            result_display = gr.Image(label="RESULT VIEW")
 
-    submit_btn.click(
+    run_btn.click(
         fn=process_edit, 
-        inputs=[input_target, input_ref, prompt_text], 
-        outputs=output_view
+        inputs=[url1, url2, prompt_input, neg_input], 
+        outputs=result_display
     )
 
+# Koyeb needs 0.0.0.0 to expose the port
 demo.launch(server_name="0.0.0.0", server_port=8000)
